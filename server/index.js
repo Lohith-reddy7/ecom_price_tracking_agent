@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import authRoutes from './routes/auth.js';
 import productRoutes from './routes/products.js';
 import ragRoutes from './routes/rag.js';
+import { startPriceTrackingScheduler } from './services/priceTrackerService.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -12,6 +13,7 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+dotenv.config({ path: path.resolve(__dirname, '.env') });
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
 const app = express();
@@ -22,7 +24,12 @@ app.use(express.json());
 
 // MongoDB Connection
 mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/price-tracker')
-.then(() => console.log('MongoDB connected successfully'))
+.then(() => {
+  console.log('MongoDB connected successfully');
+  // Start automatic background price tracking (scheduled every 12 hours)
+  const checkIntervalHours = Number(process.env.PRICE_CHECK_INTERVAL_HOURS) || 12;
+  startPriceTrackingScheduler(checkIntervalHours);
+})
 .catch((err) => console.error('MongoDB connection error:', err));
 
 // Routes

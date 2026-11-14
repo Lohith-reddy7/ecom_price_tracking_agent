@@ -9,6 +9,9 @@ server/node_modules/
 .env.development.local
 .env.test.local
 .env.production.local
+.env
+.env.*
+!.env.example
 
 # Production build
 client/build/

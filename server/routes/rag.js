@@ -64,10 +64,10 @@ router.post('/reindex-all', auth, async (req, res) => {
 // 3. Query RAG
 router.post('/query', auth, async (req, res) => {
   try {
-    const { query, topK = 5, filters = {} } = req.body;
+    const { query, productId, topK = 3, filters = {} } = req.body;
     if (!query) return res.status(400).json({ message: "Query is required" });
 
-    const result = await answerRagQuestion({ userId: req.userId, query, topK, filters });
+    const result = await answerRagQuestion({ userId: req.userId, productId, query, topK, filters });
     res.json(result);
   } catch (error) {
     console.error("RAG query error:", error);

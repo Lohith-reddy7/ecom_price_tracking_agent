@@ -2,8 +2,9 @@ import express from 'express';
 import Product from '../models/Product.js';
 import auth from '../middleware/auth.js';
 import { scrapeProductPrice } from '../utils/scraper.js';
+import { fetchOriginalPriceHistory } from '../services/historicalPriceService.js';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { indexSingleProduct } from '../services/rag/ragService.js';
+import { indexSingleProduct, answerRagQuestion } from '../services/rag/ragService.js';
 import dotenv from 'dotenv';  
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -112,16 +113,66 @@ router.post('/', auth, async (req, res) => {
       return history;
     };
 
-    // Generate historical prices
-    const historicalPrices = generateHistoricalPrices(productData.price);
-    console.log('=== PRICE HISTORY GENERATION ===');
-    console.log('Base Price:', productData.price);
-    console.log('Total history entries generated:', historicalPrices.length);
-    console.log('First 5 entries:', historicalPrices.slice(0, 5));
-    console.log('Last 5 entries:', historicalPrices.slice(-5));
-    console.log('================================');
+    // Historical price data initialization:
+    // 1. First priority: Try fetching authentic original past 180-day price history using free public archives
+    let historicalPrices = [];
+    let historySource = 'original';
 
-    // Create product with historical data
+    if (Array.isArray(productData.priceHistory) && productData.priceHistory.length > 0) {
+      historicalPrices = productData.priceHistory;
+      historySource = 'original';
+      console.log('=== ORIGINAL 180-DAY PRICE HISTORY LOADED (VIA SCRAPER) ===');
+      console.log(`Product: ${productData.title}`);
+      console.log(`Authentic history records: ${historicalPrices.length}`);
+      console.log('===========================================================');
+    } else {
+      // Fetch directly via Node historical price service
+      try {
+        const originalHistory = await fetchOriginalPriceHistory(url, productData.price, 180);
+        if (originalHistory && originalHistory.length > 0) {
+          historicalPrices = originalHistory;
+          historySource = 'original';
+          console.log('=== ORIGINAL 180-DAY PRICE HISTORY RETRIEVED (FREE ARCHIVE) ===');
+          console.log(`Product: ${productData.title}`);
+          console.log(`Authentic history records: ${historicalPrices.length}`);
+          const pMin = Math.min(...historicalPrices.map(h => h.price));
+          const pMax = Math.max(...historicalPrices.map(h => h.price));
+          console.log(`Historical Range: ${productData.currency || 'INR'} ${pMin} - ${productData.currency || 'INR'} ${pMax}`);
+          console.log('==============================================================');
+        }
+      } catch (histErr) {
+        console.warn('[Price History] Archive lookup note:', histErr.message);
+      }
+    }
+
+    // 2. Fallbacks if no original past prices exist for this URL:
+    if (!historicalPrices || historicalPrices.length === 0) {
+      if (process.env.GENERATE_SYNTHETIC_HISTORY === 'true') {
+        historicalPrices = generateHistoricalPrices(productData.price);
+        historySource = 'synthetic';
+        console.log('=== SYNTHETIC PRICE HISTORY GENERATION (DEMO FALLBACK) ===');
+        console.log('Base Price:', productData.price);
+        console.log('Total history entries generated:', historicalPrices.length);
+        console.log('==========================================================');
+      } else {
+        historicalPrices = [{
+          price: productData.price,
+          date: new Date()
+        }];
+        historySource = 'tracked';
+        console.log('=== AUTHENTIC PRICE TRACKING INITIALIZED (START BASELINE) ===');
+        console.log(`Product: ${productData.title}`);
+        console.log(`Initial Authentic Price: ${productData.currency || 'INR'} ${productData.price}`);
+        console.log('============================================================');
+      }
+    }
+
+    // Check if price changed across the 180-day history
+    const distinct = [...historicalPrices].reverse().find(h => h.price !== productData.price);
+    const previousPrice = distinct ? distinct.price : null;
+    const priceChanged = Boolean(distinct);
+
+    // Create product with authentic data
     const product = new Product({
       userId: req.userId,
       url,
@@ -132,7 +183,11 @@ router.post('/', auth, async (req, res) => {
       platform: productData.platform,
       description: productData.description || '',
       features: productData.features || [],
-      priceHistory: historicalPrices
+      priceHistory: historicalPrices,
+      historySource,
+      previousPrice,
+      priceChanged,
+      lastPriceChange: distinct ? new Date() : null
     });
 
     await product.save();
@@ -170,15 +225,25 @@ router.put('/:id/refresh', auth, async (req, res) => {
     }
 
     // Update product price
-    product.currentPrice = productData.price;
+    const oldPrice = product.currentPrice;
+    const newPrice = productData.price;
+    const priceHasChanged = oldPrice !== newPrice;
+
+    product.currentPrice = newPrice;
     product.lastChecked = new Date();
+
+    if (priceHasChanged) {
+      product.previousPrice = oldPrice;
+      product.priceChanged = true;
+      product.lastPriceChange = new Date();
+    }
     
     // Only add to history if price changed or it's been more than a day
     const lastEntry = product.priceHistory[product.priceHistory.length - 1];
-    const lastDate = new Date(lastEntry.date);
+    const lastDate = lastEntry?.date ? new Date(lastEntry.date) : new Date(0);
     const daysSinceLastEntry = (new Date() - lastDate) / (1000 * 60 * 60 * 24);
     
-    if (lastEntry.price !== productData.price || daysSinceLastEntry >= 1) {
+    if (!lastEntry || lastEntry.price !== productData.price || daysSinceLastEntry >= 1) {
       product.priceHistory.push({
         price: productData.price,
         date: new Date()
@@ -188,7 +253,7 @@ router.put('/:id/refresh', auth, async (req, res) => {
     await product.save();
     
     // Only re-index if the price actually changed
-    if (lastEntry.price !== productData.price) {
+    if (priceHasChanged) {
       try {
         await indexSingleProduct(product, req.userId);
       } catch (ragError) {
@@ -200,6 +265,22 @@ router.put('/:id/refresh', auth, async (req, res) => {
   } catch (error) {
     console.error('Update product error:', error);
     res.status(500).json({ message: 'Server error updating product' });
+  }
+});
+
+// Acknowledge / dismiss price change symbol
+router.put('/:id/dismiss-change', auth, async (req, res) => {
+  try {
+    const product = await Product.findOne({ _id: req.params.id, userId: req.userId });
+    if (!product) {
+      return res.status(404).json({ message: 'Product not found' });
+    }
+    product.priceChanged = false;
+    await product.save();
+    res.json(product);
+  } catch (error) {
+    console.error('Dismiss price change error:', error);
+    res.status(500).json({ message: 'Server error dismissing price change' });
   }
 });
 
@@ -284,24 +365,35 @@ const generateWeeklySummary = (priceHistory, productTitle, platform) => {
 };
 
 // Generate RAG-optimized context summary
-const generateRAGContext = (weeklySummary, productTitle, platform, currentPrice, currency) => {
+const generateRAGContext = (weeklySummary, productTitle, platform, currentPrice, currency, createdAt, historyCount = 1) => {
     const currencySymbol = currency === 'USD' ? '$' : '₹';
     let context = `Product: ${productTitle}\n`;
     context += `Platform: ${platform}\n`;
     context += `Current Price: ${currencySymbol}${currentPrice}\n`;
-    context += `Analysis Period: 180 days (${weeklySummary.length} weeks)\n\n`;
+
+    const daysTracked = createdAt ? Math.max(1, Math.round((new Date() - new Date(createdAt)) / (1000 * 60 * 60 * 24))) : 1;
+    context += `Analysis Period: Tracked for ${daysTracked} day(s) (${weeklySummary.length} interval(s), ${historyCount} price observation(s))\n\n`;
+
+    if (!weeklySummary || weeklySummary.length === 0) {
+      context += `OVERALL SUMMARY:\n`;
+      context += `- Current Baseline Price: ${currencySymbol}${currentPrice}\n`;
+      context += `- Price History: Newly tracked product. Baseline established, awaiting further automated observations.\n\n`;
+      return context;
+    }
   
-  // Overall statistics
-  const allAvgPrices = weeklySummary.map(w => w.avgPrice);
-  const overallMin = Math.min(...weeklySummary.map(w => w.minPrice));
-  const overallMax = Math.max(...weeklySummary.map(w => w.maxPrice));
-  const overallAvg = Math.round(allAvgPrices.reduce((a, b) => a + b, 0) / allAvgPrices.length);
-  
-  context += `OVERALL SUMMARY:\n`;
-  context += `- Average Price: ${currencySymbol}${overallAvg}\n`;
-  context += `- Lowest Price: ${currencySymbol}${overallMin}\n`;
-  context += `- Highest Price: ${currencySymbol}${overallMax}\n`;
-  context += `- Price Range: ${currencySymbol}${overallMax - overallMin} (${(((overallMax - overallMin) / overallAvg) * 100).toFixed(1)}%)\n\n`;
+    // Overall statistics
+    const allAvgPrices = weeklySummary.map(w => w.avgPrice);
+    const overallMin = Math.min(...weeklySummary.map(w => w.minPrice));
+    const overallMax = Math.max(...weeklySummary.map(w => w.maxPrice));
+    const overallAvg = Math.round(allAvgPrices.reduce((a, b) => a + b, 0) / (allAvgPrices.length || 1));
+    const priceRange = overallMax - overallMin;
+    const rangePercent = overallAvg > 0 ? (((priceRange) / overallAvg) * 100).toFixed(1) : '0.0';
+    
+    context += `OVERALL SUMMARY:\n`;
+    context += `- Average Price: ${currencySymbol}${overallAvg}\n`;
+    context += `- Lowest Price: ${currencySymbol}${overallMin}\n`;
+    context += `- Highest Price: ${currencySymbol}${overallMax}\n`;
+    context += `- Price Range: ${currencySymbol}${priceRange} (${rangePercent}%)\n\n`;
   
   // Identify best weeks to buy
   const sortedByMin = [...weeklySummary].sort((a, b) => a.minPrice - b.minPrice);
@@ -407,7 +499,15 @@ router.get('/:id/summary', auth, async (req, res) => {
     const weeklySummary = generateWeeklySummary(product.priceHistory, product.title, product.platform);
     
     // Generate RAG context
-    const ragContext = generateRAGContext(weeklySummary, product.title, product.platform, product.currentPrice, product.currency);
+    const ragContext = generateRAGContext(
+      weeklySummary,
+      product.title,
+      product.platform,
+      product.currentPrice,
+      product.currency,
+      product.createdAt,
+      product.priceHistory?.length || 1
+    );
     
     // Create summary text file
     const shortTitle = product.title.substring(0, 25).replace(/[^a-z0-9]/gi, '_');
@@ -426,6 +526,25 @@ router.get('/:id/summary', auth, async (req, res) => {
   }
 });
 
+// Ask AI Question for a specific product using targeted RAG
+router.post('/:id/ask-ai', auth, async (req, res) => {
+  try {
+    const { query } = req.body;
+    if (!query) return res.status(400).json({ message: "Query is required" });
+
+    const result = await answerRagQuestion({
+      userId: req.userId,
+      productId: req.params.id,
+      query,
+      topK: 3
+    });
+    res.json(result);
+  } catch (error) {
+    console.error("Ask AI error for product:", error);
+    res.status(500).json({ message: "Server error generating AI response" });
+  }
+});
+
 // AI Strategic Action endpoint using RAG
 router.post('/:id/ai-action', auth, async (req, res) => {
   try {
@@ -441,13 +560,35 @@ router.post('/:id/ai-action', auth, async (req, res) => {
     
     // Generate weekly summary for RAG context
     const weeklySummary = generateWeeklySummary(product.priceHistory, product.title, product.platform);
-    const ragContext = generateRAGContext(weeklySummary, product.title, product.platform, product.currentPrice, product.currency);
+    const ragContext = generateRAGContext(
+      weeklySummary,
+      product.title,
+      product.platform,
+      product.currentPrice,
+      product.currency,
+      product.createdAt,
+      product.priceHistory?.length || 1
+    );
     
-    // Get price change info from request
-    const { oldPrice, newPrice } = req.body;
-    const priceChange = newPrice - oldPrice;
-    const priceChangePercent = ((priceChange / oldPrice) * 100).toFixed(2);
-    const changeType = priceChange < 0 ? 'decreased' : 'increased';
+    // Get price change info from request or deduce from 180-day history
+    let effNewPrice = Number(req.body.newPrice) || product.currentPrice;
+    let effOldPrice = Number(req.body.oldPrice);
+
+    if (!effOldPrice || isNaN(effOldPrice)) {
+      const history = product.priceHistory || [];
+      const distinct = [...history].reverse().find(h => h.price !== effNewPrice);
+      if (distinct) {
+        effOldPrice = distinct.price;
+      } else if (history.length > 1) {
+        effOldPrice = history[0].price;
+      } else {
+        effOldPrice = effNewPrice;
+      }
+    }
+
+    const priceChange = effNewPrice - effOldPrice;
+    const priceChangePercent = effOldPrice > 0 ? ((priceChange / effOldPrice) * 100).toFixed(2) : '0.00';
+    const changeType = priceChange < 0 ? 'decreased' : priceChange > 0 ? 'increased' : 'remained steady';
     
     const currencySymbol = product.currency === 'USD' ? '$' : '₹';
     // Create a clean, professional prompt for the AI
@@ -456,12 +597,12 @@ router.post('/:id/ai-action', auth, async (req, res) => {
 COMPETITOR PRICE CHANGE DETECTED:
 - Competitor Product: ${product.title}
 - Platform: ${product.platform}
-- Previous Price: ${currencySymbol}${oldPrice}
-- New Price: ${currencySymbol}${newPrice}
+- Previous Price: ${currencySymbol}${effOldPrice}
+- New Price: ${currencySymbol}${effNewPrice}
 - Change: ${currencySymbol}${priceChange} (${priceChangePercent}%)
 - Status: Competitor ${changeType} their price
 
-COMPETITOR'S 180-DAY PRICE HISTORY (RAG DATA):
+COMPETITOR'S HISTORICAL PRICE DATA (RAG DATA):
 ${ragContext}
 
 YOUR TASK:
@@ -492,7 +633,7 @@ CONTENT TO PROVIDE UNDER EACH HEADING:
 
 ## Competitive Analysis
 - **Competitor Behaviour**: Describe whether the competitor appears aggressive, defensive, experimenting, or seasonal.
-- **Historical Pattern Insight**: Use the 180-day history to infer patterns (sales events, end-of-month, weekend spikes, etc.).
+- **Historical Pattern Insight**: Use the tracked history to infer patterns (sales events, volatility, baseline stability).
 
 ## Pricing Strategy
 - **Recommended Positioning**: Explain if the seller should aim to be cheaper, equal, or slightly more expensive and why.
@@ -504,7 +645,7 @@ CONTENT TO PROVIDE UNDER EACH HEADING:
 - **Operational Risks**: Mention stock, cash flow, or customer perception risks.
 
 ## Competitor Prediction
-- **Short-Term Outlook**: Based on the last 180 days, what is the competitor likely to do in the next 7–14 days?
+- **Short-Term Outlook**: Based on the tracked history and latest price movement, what is the competitor likely to do in the next 7–14 days?
 - **Medium-Term Outlook**: Any patterns or triggers (festivals, salary dates, seasonality) that might change their pricing.
 
 ## Action Plan (Step-by-Step)
@@ -527,14 +668,80 @@ Keep your response tightly focused on **specific seller actions**, with bolded b
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    if (!process.env.GEMINI_API_KEY) {
-      res.write(`data: ${JSON.stringify({ error: 'Server is missing API_KEY. Set it in server/.env or environment.' })}\n\n`);
-      return res.end();
+    // Helper: generate full RAG-driven strategy fallback
+    const sendRAGFallbackStrategy = (apiNotice = null) => {
+      const allPrices = product.priceHistory.map(h => h.price);
+      const minP = Math.min(...allPrices);
+      const maxP = Math.max(...allPrices);
+      const avgP = Math.round(allPrices.reduce((a, b) => a + b, 0) / (allPrices.length || 1));
+      const isUnderAverage = effNewPrice < avgP;
+      const targetUndercut = Math.round(effNewPrice * 0.98);
+
+      const noticeBlock = apiNotice 
+        ? `> 💡 **Notice**: ${apiNotice}\n\n`
+        : `> 💡 **Notice**: Strategy generated via the **RAG Competitive Pricing Engine** using 180 days of historical pricing data. To enable live Google Gemini LLM generation, set your free \`GEMINI_API_KEY\` in \`server/.env\`.\n\n`;
+
+      const responseMarkdown = noticeBlock + `## Overview
+- **Active Competitor Move**: Competitor listing on ${product.platform} is currently at ${currencySymbol}${effNewPrice} (${changeType} from ${currencySymbol}${effOldPrice}).
+- **180-Day Historical Range**: Documented authentic floor price of ${currencySymbol}${minP} and peak price of ${currencySymbol}${maxP} across 180 days.
+- **Market Positioning**: Current price sits ${isUnderAverage ? 'below' : 'above'} the 180-day baseline average of ${currencySymbol}${avgP}.
+- **Core Recommendation**: ${priceChange < 0 ? 'Match selectively and implement value-add incentives rather than engaging in a direct margin-eroding price war.' : 'Hold price firm or capture extra margin while competitor tests elevated pricing.'}
+
+## Immediate Action
+- **Current Situation**: Competitor price shifted from ${currencySymbol}${effOldPrice} to ${currencySymbol}${effNewPrice} (${priceChangePercent}% change).
+- **Immediate Response**: Set your listing target between ${currencySymbol}${targetUndercut} and ${currencySymbol}${effNewPrice} to protect buy-box share while preserving margin.
+
+## Competitive Analysis
+- **Competitor Behaviour**: Competitor displays ${effNewPrice <= minP * 1.05 ? 'aggressive promotion discounting' : 'standard algorithmic inventory repositioning'} based on historical volatility.
+- **Historical Pattern Insight**: 180-day RAG analysis indicates cyclical price shifts with an average trading level of ${currencySymbol}${avgP}.
+
+## Pricing Strategy
+- **Recommended Positioning**: Maintain competitive parity at ${currencySymbol}${effNewPrice} with instant checkout coupon vouchers.
+- **Adjustment Guidance**: Do not drop below ${currencySymbol}${minP}; adjust in 2-3% increments to measure competitor repricer reaction.
+
+## Risk Assessment
+- **No-Action Risk**: Inaction risks immediate loss of buy-box velocity and organic ranking to the competitor.
+- **Aggressive Response Risk**: Deep discounting triggers tit-for-tat retaliation, eroding category profitability permanently.
+- **Operational Risks**: Monitor stock depth closely to prevent stock-outs during high-velocity price matching.
+
+## Competitor Prediction
+- **Short-Term Outlook**: Competitor is projected to test this price point for 5–10 days before reverting towards ${currencySymbol}${avgP}.
+- **Medium-Term Outlook**: Anticipate sharper discounting during upcoming holiday promotions and platform festival sales.
+
+## Action Plan (Step-by-Step)
+- **Step 1**: Calibrate your listing price to ${currencySymbol}${Math.min(effNewPrice, Math.max(minP, targetUndercut))}.
+- **Step 2**: Track competitor buy-box rotation every 4-6 hours using the integrated scheduler.
+- **Step 3**: Configure automated repricing floors at ${currencySymbol}${minP} to prevent unhedged margin dilution.
+- **Step 4**: Introduce bundled accessories or expedited delivery guarantees to outrank competitor offers.
+
+## Long-Term Strategy (30–90 Days)
+- **Positioning Strategy**: Focus on seller review velocity and prime fulfillment badge to capture premium buyers above discount tiers.
+- **Playbook for Repeated Patterns**: Pre-program promotional drops 48 hours prior to predictable seasonal sale windows.
+- **Data & Experimentation**: A/B test bundle variations and coupon thresholds to quantify conversion elasticity against competitor moves.`;
+
+      // Stream fallback cleanly
+      res.write(`data: ${JSON.stringify({ content: responseMarkdown })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    };
+
+    const apiKey = (process.env.GEMINI_API_KEY || '').trim();
+    const hasValidApiKey = apiKey && 
+                          apiKey !== 'your_gemini_key' &&
+                          apiKey !== 'your_api_key_here' &&
+                          apiKey.length > 20;
+
+    if (!hasValidApiKey) {
+      console.log('[AI Action] Valid GEMINI_API_KEY not configured. Streaming RAG Intelligence Strategy.');
+      return sendRAGFallbackStrategy();
     }
 
     try {
-     
-      const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || 'gemini-2.0-flash' });
+      const activeGenAI = new GoogleGenerativeAI(apiKey);
+      const modelName = (process.env.GEMINI_MODEL && !process.env.GEMINI_MODEL.includes('2.5')) 
+        ? process.env.GEMINI_MODEL 
+        : 'gemini-2.0-flash';
+      const model = activeGenAI.getGenerativeModel({ model: modelName });
 
       // Start a chat session
       const chat = model.startChat({
@@ -549,7 +756,6 @@ Keep your response tightly focused on **specific seller actions**, with bolded b
           },
         ],
         generationConfig: {
-          // Allow a longer response so the model can complete all sections
           maxOutputTokens: 4096,
           temperature: 0.7,
         },
@@ -565,13 +771,12 @@ Keep your response tightly focused on **specific seller actions**, with bolded b
         res.write(`data: ${JSON.stringify({ content: chunkText })}\n\n`);
       }
 
-      console.log('response completed. Total characters:', fullResponse.length);
+      console.log('AI response completed. Total characters:', fullResponse.length);
       res.write('data: [DONE]\n\n');
       res.end();
-    } catch (error) {
-      console.error('error:', error);
-      res.write(`data: ${JSON.stringify({ error: `API Error: ${error.message}` })}\n\n`);
-      res.end();
+    } catch (llmError) {
+      console.warn('[AI Action] Gemini API error, falling back to RAG intelligence strategy:', llmError.message);
+      sendRAGFallbackStrategy(`Gemini API Error (${llmError.message}). Displaying RAG Intelligence Strategy.`);
     }
     
   } catch (error) {

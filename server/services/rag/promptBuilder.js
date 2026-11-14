@@ -1,36 +1,27 @@
-export const buildSellerIntelligencePrompt = ({ query, retrievedChunks, metrics }) => {
-  let prompt = `You are a competitive seller intelligence assistant.
-Answer only using the retrieved product context and price metrics.
-Do not invent products or prices.
-If context is insufficient, say what is missing.
+export const buildSellerIntelligencePrompt = ({ query, retrievedChunks, productTitle, metrics }) => {
+  let prompt = `You are a precision e-commerce pricing intelligence assistant for the product: "${productTitle || 'Tracked Competitor Product'}".
+
+INSTRUCTIONS:
+1. Answer the user's specific question directly, concisely, and accurately based strictly on the retrieved competitor data below.
+2. Focus ONLY on answering what was asked. DO NOT regurgitate all retrieved chunks, and do NOT provide irrelevant background info.
+3. Keep the response crisp (typically 2 to 4 bullet points or a concise paragraph) highlighting exact prices, percentages, or dates.
+4. If the question asks for a recommendation or strategy, provide actionable seller guidance in 2-3 bullet points.
 
 USER QUESTION:
-${query}
+"${query}"
 
-RETRIEVED CONTEXT:\n`;
+RETRIEVED VECTOR CONTEXT:
+`;
 
   retrievedChunks.forEach((chunk, index) => {
-    prompt += `Source ${index + 1}:
-- Product title: ${chunk.title}
-- Platform: ${chunk.metadata?.platform || 'Unknown'}
-- Current price: ${chunk.metadata?.currentPrice ? `₹${chunk.metadata.currentPrice}` : 'Unknown'}
-- Chunk type: ${chunk.chunkType}
-- Similarity score: ${chunk.score}
-- Chunk text: ${chunk.chunkText}\n\n`;
+    prompt += `--- Source ${index + 1} (${chunk.chunkType}) [Similarity: ${(chunk.score * 100).toFixed(0)}%] ---
+${chunk.chunkText}
+\n`;
   });
 
   if (metrics) {
-    prompt += `STRUCTURED METRICS:\n${JSON.stringify(metrics, null, 2)}\n\n`;
+    prompt += `KEY PRICE METRICS:\n${JSON.stringify(metrics, null, 2)}\n\n`;
   }
-
-  prompt += `OUTPUT FORMAT:
-## Summary
-## Retrieved Evidence
-## Pricing Analysis
-## Seller Strategy
-## Risks
-## Recommended Action
-`;
 
   return prompt;
 };

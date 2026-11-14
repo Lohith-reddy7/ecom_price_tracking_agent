@@ -45,6 +45,14 @@ const productChunkSchema = new mongoose.Schema({
     priceVolatility: Number,
     trend: String
   },
+  embedding: {
+    type: [Number],
+    default: []
+  },
+  vectorTokens: {
+    type: mongoose.Schema.Types.Mixed,
+    default: {}
+  },
   indexedInPinecone: {
     type: Boolean,
     default: false
@@ -61,7 +69,6 @@ const productChunkSchema = new mongoose.Schema({
 
 productChunkSchema.index({ userId: 1 });
 productChunkSchema.index({ productId: 1 });
-productChunkSchema.index({ chunkId: 1 });
 productChunkSchema.index({ chunkType: 1 });
 
 export default mongoose.model('ProductChunk', productChunkSchema);

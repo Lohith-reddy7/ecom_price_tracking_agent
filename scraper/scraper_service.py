@@ -1,8 +1,9 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import requests, random, re, time
+import requests, random, re, time, base64
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
+from datetime import datetime, timedelta
 
 # Optional Selenium
 try:
@@ -172,6 +173,121 @@ def scrape_with_selenium(url, platform):
         if driver:
             driver.quit()
 
+def clean_archive_url(url):
+    clean = url.strip()
+    clean = clean.replace("://dl.flipkart.com/dlhttp://", "://").replace("://dl.flipkart.com/dlhttps://", "://")
+    clean = re.sub(r'/gp/aw/d/', '/dp/', clean)
+    clean = clean.replace('//m.flipkart.com/', '//www.flipkart.com/').replace('dl.flipkart.com/dl/', 'www.flipkart.com/')
+    asin_match = re.search(r'/(?:dp|gp/product)/([A-Z0-9]{10})', clean, re.I)
+    if asin_match and 'amazon' in clean.lower():
+        asin = asin_match.group(1)
+        domain = 'amazon.in' if 'amazon.in' in clean.lower() else 'amazon.com'
+        clean = f"https://www.{domain}/dp/{asin}"
+    return clean
+
+def fetch_original_price_history(url, current_price=None, days=180):
+    """
+    Fetches authentic past prices for a product from public historical price archives.
+    Projects continuous daily prices for up to 180 days.
+    """
+    try:
+        clean_url = clean_archive_url(url)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Content-Type': 'application/json',
+            'Referer': 'https://pricehistory.app/'
+        }
+
+        # 1. Search for indexed code
+        resp = requests.post(
+            'https://pricehistory.app/api/search',
+            json={'url': clean_url},
+            headers=headers,
+            timeout=12
+        )
+        if resp.status_code != 200:
+            return None
+        search_data = resp.json()
+        if not search_data.get('status') or not search_data.get('code'):
+            return None
+
+        code = search_data['code']
+        page_url = f"https://pricehistory.app/p/{code}"
+
+        # 2. Fetch page HTML
+        page_resp = requests.get(page_url, headers=headers, timeout=12)
+        if page_resp.status_code != 200:
+            return None
+
+        page_html = page_resp.text
+
+        # 3. Extract and decrypt dataset
+        match_data = re.search(r'var\s+PagePriceHistoryDataSet\s*=\s*[\'"]([^\'"]+)[\'"]', page_html)
+        match_key = re.search(r'(?:let|var)\s+CachedKey\s*=\s*[\'"]([^\'"]+)[\'"]', page_html)
+        if not match_data or not match_key:
+            return None
+
+        raw_b64 = match_data.group(1)
+        key = match_key.group(1)
+
+        decoded_bytes = base64.b64decode(raw_b64)
+        key_bytes = key.encode('utf-8')
+        result_bytes = bytearray()
+        for i, b in enumerate(decoded_bytes):
+            result_bytes.append(b ^ key_bytes[i % len(key_bytes)])
+
+        dataset = json.loads(result_bytes.decode('utf-8'))
+        raw_history = dataset.get('History', {}).get('Price', [])
+        if not isinstance(raw_history, list) or not raw_history:
+            return None
+
+        price_by_date = {}
+        for entry in raw_history:
+            p = entry.get('y')
+            d = entry.get('x')
+            if p is not None and d:
+                price_by_date[d] = float(p)
+
+        if not price_by_date:
+            return None
+
+        sorted_dates = sorted(price_by_date.keys())
+        today = datetime.now().date()
+        start_date = today - timedelta(days=days)
+        start_date_str = start_date.strftime('%Y-%m-%d')
+
+        prior_price = None
+        for d_str in sorted_dates:
+            if d_str <= start_date_str:
+                prior_price = price_by_date[d_str]
+            else:
+                break
+
+        if prior_price is None:
+            prior_price = price_by_date[sorted_dates[0]]
+
+        history = []
+        running_price = prior_price
+
+        for i in range(days + 1):
+            target_date = start_date + timedelta(days=i)
+            target_str = target_date.strftime('%Y-%m-%d')
+            if target_str in price_by_date:
+                running_price = price_by_date[target_str]
+
+            history.append({
+                'price': running_price,
+                'date': target_date.isoformat()
+            })
+
+        if current_price and history:
+            history[-1]['price'] = float(current_price)
+
+        return history
+    except Exception as e:
+        print(f"fetch_original_price_history notice: {e}")
+        return None
+
 @app.route("/scrape", methods=["POST"])
 def scrape():
     try:
@@ -192,9 +308,41 @@ def scrape():
             result = scrape_with_selenium(url, platform)
 
         if result:
+            # Attempt to fetch authentic original historical prices (180 days)
+            try:
+                original_history = fetch_original_price_history(url, result.get("price"), 180)
+                if original_history:
+                    result["priceHistory"] = original_history
+                    result["isAuthenticHistory"] = True
+                    print(f"Attached {len(original_history)} authentic original past prices to response.")
+                else:
+                    result["priceHistory"] = []
+                    result["isAuthenticHistory"] = False
+            except Exception as hist_err:
+                print(f"Price history retrieval notice: {hist_err}")
+                result["priceHistory"] = []
+                result["isAuthenticHistory"] = False
+
             return jsonify(result), 200
         
         return jsonify({"error": "Failed to extract product data. The page might be protected or the structure has changed."}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/history", methods=["POST"])
+def history_endpoint():
+    try:
+        data = request.get_json() or {}
+        url = data.get("url")
+        current_price = data.get("currentPrice")
+        days = int(data.get("days", 180))
+        if not url:
+            return jsonify({"error": "URL required"}), 400
+
+        history = fetch_original_price_history(url, current_price, days)
+        if history:
+            return jsonify({"success": True, "history": history, "count": len(history)}), 200
+        return jsonify({"success": False, "message": "No archive history available for this URL"}), 404
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

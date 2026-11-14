@@ -8,11 +8,15 @@ const auth = (req, res, next) => {
       return res.status(401).json({ message: 'No authentication token, access denied' });
     }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your_jwt_secret_key');
+    const secret = process.env.JWT_ACCESS_SECRET || process.env.JWT_SECRET || 'your_jwt_secret_key';
+    const decoded = jwt.verify(token, secret);
     req.userId = decoded.userId;
     next();
   } catch (error) {
-    res.status(401).json({ message: 'Token is not valid' });
+    if (error.name === 'TokenExpiredError') {
+      return res.status(401).json({ message: 'Access token expired', code: 'TOKEN_EXPIRED' });
+    }
+    res.status(401).json({ message: 'Token is not valid', code: 'TOKEN_INVALID' });
   }
 };
 

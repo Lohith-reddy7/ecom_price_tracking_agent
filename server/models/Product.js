@@ -44,6 +44,23 @@ const productSchema = new mongoose.Schema({
       default: Date.now
     }
   }],
+  historySource: {
+    type: String,
+    enum: ['original', 'synthetic', 'tracked'],
+    default: 'original'
+  },
+  previousPrice: {
+    type: Number,
+    default: null
+  },
+  priceChanged: {
+    type: Boolean,
+    default: false
+  },
+  lastPriceChange: {
+    type: Date,
+    default: null
+  },
   createdAt: {
     type: Date,
     default: Date.now

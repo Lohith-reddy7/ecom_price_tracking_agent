@@ -13,11 +13,20 @@ const Dashboard = () => {
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [refreshingId, setRefreshingId] = useState(null);
-  const [priceAlerts, setPriceAlerts] = useState({}); // Track persistent price drop alerts per product
+  const [priceAlerts, setPriceAlerts] = useState({}); // Track price alerts per product
+
+  // AI Strategic Repricing Modal State
   const [aiModalOpen, setAiModalOpen] = useState(false);
   const [aiResponse, setAiResponse] = useState('');
   const [aiLoading, setAiLoading] = useState(false);
   const [selectedProduct, setSelectedProduct] = useState(null);
+
+  // Product-Specific "Ask AI" Modal State
+  const [askAiModalOpen, setAskAiModalOpen] = useState(false);
+  const [askAiProduct, setAskAiProduct] = useState(null);
+  const [askAiQuery, setAskAiQuery] = useState('');
+  const [askAiAnswer, setAskAiAnswer] = useState('');
+  const [askAiLoading, setAskAiLoading] = useState(false);
 
   const ALERT_STORAGE_KEY = 'priceAlerts';
   const ONE_DAY_MS = 24 * 60 * 60 * 1000;
@@ -57,21 +66,6 @@ const Dashboard = () => {
     }
   }, [priceAlerts]);
 
-  // Auto-refresh for JharkhandEcom products every 5 seconds
-  useEffect(() => {
-    const jharkhandProducts = products.filter(p => p.platform === 'JharkhandEcom');
-    
-    if (jharkhandProducts.length === 0) return;
-
-    const intervalId = setInterval(() => {
-      jharkhandProducts.forEach(product => {
-        autoRefreshProduct(product._id, product.currentPrice);
-      });
-    }, 300000); // 5 minutes
-
-    return () => clearInterval(intervalId);
-  }, [products]);
-
   const fetchProducts = async () => {
     try {
       const response = await axios.get('/api/products');
@@ -103,31 +97,6 @@ const Dashboard = () => {
     }
   };
 
-  const autoRefreshProduct = async (productId, oldPrice) => {
-    try {
-      const response = await axios.put(`/api/products/${productId}/refresh`);
-      const newProduct = response.data;
-      
-      if (newProduct.currentPrice !== oldPrice) {
-        const alert = {
-          oldPrice: oldPrice,
-          newPrice: newProduct.currentPrice,
-          firstDetectedAt: Date.now(),
-          acknowledged: false
-        };
-        
-        setPriceAlerts(prev => ({ ...prev, [productId]: alert }));
-        
-        // Automatically trigger AI action on price change
-        handleAIAction(newProduct, alert);
-      }
-      
-      setProducts(products => products.map(p => p._id === productId ? newProduct : p));
-    } catch (error) {
-      console.error('Auto-refresh error:', error);
-    }
-  };
-
   const acknowledgeAlert = (productId) => {
     setPriceAlerts(prev => {
       const next = { ...prev };
@@ -138,6 +107,21 @@ const Dashboard = () => {
     });
   };
 
+  const handleDismissPriceChange = async (productId) => {
+    try {
+      await axios.put(`/api/products/${productId}/dismiss-change`);
+      setProducts(prev =>
+        prev.map(p => (p._id === productId ? { ...p, priceChanged: false } : p))
+      );
+      acknowledgeAlert(productId);
+    } catch (err) {
+      console.error('Error dismissing price change badge:', err);
+      setProducts(prev =>
+        prev.map(p => (p._id === productId ? { ...p, priceChanged: false } : p))
+      );
+    }
+  };
+
   const handleAIAction = async (product, priceAlert) => {
     setSelectedProduct(product);
     setAiModalOpen(true);
@@ -145,7 +129,23 @@ const Dashboard = () => {
     setAiLoading(true);
 
     try {
-      const token = localStorage.getItem('token');
+      const token = localStorage.getItem('accessToken') || localStorage.getItem('token');
+      
+      let oldPrice = priceAlert?.oldPrice || product.previousPrice;
+      let newPrice = priceAlert?.newPrice || product.currentPrice;
+
+      if (!oldPrice) {
+        const history = product.priceHistory || [];
+        const distinct = [...history].reverse().find(h => h.price !== newPrice);
+        if (distinct) {
+          oldPrice = distinct.price;
+        } else if (history.length > 1) {
+          oldPrice = history[0].price;
+        } else {
+          oldPrice = newPrice;
+        }
+      }
+
       const response = await fetch(`/api/products/${product._id}/ai-action`, {
         method: 'POST',
         headers: {
@@ -153,8 +153,8 @@ const Dashboard = () => {
           'Authorization': `Bearer ${token}`
         },
         body: JSON.stringify({
-          oldPrice: priceAlert.oldPrice,
-          newPrice: priceAlert.newPrice
+          oldPrice,
+          newPrice
         })
       });
 
@@ -183,7 +183,7 @@ const Dashboard = () => {
                 setAiResponse(fullResponse);
               }
               if (parsed.error) {
-                setAiResponse(parsed.error);
+                setAiResponse(`### AI Notice\n${parsed.error}`);
                 setAiLoading(false);
               }
             } catch (e) {
@@ -196,6 +196,57 @@ const Dashboard = () => {
       console.error('AI action error:', error);
       setAiResponse('Error: Could not connect to AI service. Please ensure the server is running.');
       setAiLoading(false);
+    }
+  };
+
+  // Product-Specific "Ask AI" Handlers
+  const handleOpenAskAI = (product) => {
+    setAskAiProduct(product);
+    setAskAiModalOpen(true);
+    setAskAiQuery('');
+    setAskAiAnswer('');
+  };
+
+  const handleCloseAskAI = () => {
+    setAskAiModalOpen(false);
+    setAskAiProduct(null);
+    setAskAiQuery('');
+    setAskAiAnswer('');
+  };
+
+  const handleAskProductAI = async (e, customPrompt) => {
+    if (e && e.preventDefault) e.preventDefault();
+    const promptToSend = customPrompt || askAiQuery;
+    if (!promptToSend || !promptToSend.trim() || !askAiProduct) return;
+
+    setAskAiLoading(true);
+    setAskAiAnswer('');
+
+    try {
+      // Direct call to product-scoped AI endpoint
+      const response = await axios.post(`/api/products/${askAiProduct._id}/ask-ai`, {
+        query: promptToSend
+      });
+
+      if (response.data) {
+        setAskAiAnswer(response.data.answer || 'No answer generated.');
+      }
+    } catch (err) {
+      console.warn('Direct product ask-ai error, falling back to /api/rag/query:', err.message);
+      try {
+        const fallbackRes = await axios.post('/api/rag/query', {
+          query: promptToSend,
+          productId: askAiProduct._id,
+          topK: 3
+        });
+        if (fallbackRes.data) {
+          setAskAiAnswer(fallbackRes.data.answer || 'No answer generated.');
+        }
+      } catch (fErr) {
+        setAskAiAnswer(`Error generating targeted answer: ${err.response?.data?.message || err.message}`);
+      }
+    } finally {
+      setAskAiLoading(false);
     }
   };
 
@@ -213,20 +264,17 @@ const Dashboard = () => {
       // Update products list
       setProducts(products => products.map(p => p._id === productId ? newProduct : p));
       
-      // Check for price change and trigger alert/AI
-      if (newProduct.currentPrice !== oldPrice) {
+      // Check for price change and update alert
+      if (newProduct.currentPrice !== oldPrice || newProduct.priceChanged) {
         const alert = {
-          oldPrice: oldPrice,
+          oldPrice: newProduct.previousPrice || oldPrice,
           newPrice: newProduct.currentPrice,
           firstDetectedAt: Date.now(),
           acknowledged: false
         };
         
         setPriceAlerts(prev => ({ ...prev, [productId]: alert }));
-        
-        // Automatically trigger AI action on price change
-        handleAIAction(newProduct, alert);
-        setSuccess('Price changed! AI Strategy triggered.');
+        setSuccess(`Price change detected: ${formatPrice(alert.oldPrice, newProduct.currency)} → ${formatPrice(newProduct.currentPrice, newProduct.currency)}! AI Strategy ready.`);
       } else {
         setSuccess('Price updated successfully (no change detected).');
       }
@@ -264,21 +312,13 @@ const Dashboard = () => {
 
   const handleDownloadCSV = async (productId, productTitle) => {
     try {
-      console.log('Downloading CSV for product:', productId);
-      
       const response = await axios.get(`/api/products/${productId}/csv`, {
         responseType: 'blob'
       });
       
-      console.log('CSV response received:', response);
-      
-      // Generate short filename
       const shortTitle = productTitle.substring(0, 25).replace(/[^a-z0-9]/gi, '_');
       const filename = `${shortTitle}_prices.csv`;
       
-      console.log('Creating download with filename:', filename);
-      
-      // Create download link
       const blob = new Blob([response.data], { type: 'text/csv' });
       const url = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
@@ -287,7 +327,6 @@ const Dashboard = () => {
       document.body.appendChild(link);
       link.click();
       
-      // Cleanup
       setTimeout(() => {
         document.body.removeChild(link);
         window.URL.revokeObjectURL(url);
@@ -304,19 +343,13 @@ const Dashboard = () => {
 
   const handleDownloadSummary = async (productId, productTitle) => {
     try {
-      console.log('Downloading summary for product:', productId);
-      
       const response = await axios.get(`/api/products/${productId}/summary`, {
         responseType: 'blob'
       });
       
-      console.log('Summary response received');
-      
-      // Generate short filename
       const shortTitle = productTitle.substring(0, 25).replace(/[^a-z0-9]/gi, '_');
       const filename = `${shortTitle}_summary.txt`;
       
-      // Create download link
       const blob = new Blob([response.data], { type: 'text/plain' });
       const url = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
@@ -325,7 +358,6 @@ const Dashboard = () => {
       document.body.appendChild(link);
       link.click();
       
-      // Cleanup
       setTimeout(() => {
         document.body.removeChild(link);
         window.URL.revokeObjectURL(url);
@@ -341,6 +373,7 @@ const Dashboard = () => {
   };
 
   const formatDate = (date) => {
+    if (!date) return 'N/A';
     return new Date(date).toLocaleDateString('en-US', {
       month: 'short',
       day: 'numeric',
@@ -393,10 +426,9 @@ const Dashboard = () => {
             </div>
           )}
 
+          {/* Add Competitor Product Section */}
           <div className="add-product-section card">
-            <h3>
-              Add Competitor Product
-            </h3>
+            <h3>Add Competitor Product</h3>
             <form onSubmit={handleAddProduct} className="add-product-form">
               <input
                 type="url"
@@ -430,11 +462,17 @@ const Dashboard = () => {
             <div className="products-grid">
               {products.map((product) => {
                 const priceAlert = priceAlerts[product._id];
-                const showAlert = priceAlert && !priceAlert.acknowledged && !isExpired(priceAlert);
-                const isJharkhandEcom = product.platform === 'JharkhandEcom';
+                const hasExplicitPriceChange = Boolean(
+                  product.priceChanged || 
+                  (product.previousPrice && product.previousPrice !== product.currentPrice) ||
+                  (priceAlert && !priceAlert.acknowledged && !isExpired(priceAlert))
+                );
+
+                const oldRefPrice = product.previousPrice || priceAlert?.oldPrice;
+                const isPriceDrop = oldRefPrice ? product.currentPrice < oldRefPrice : false;
                 
                 return (
-                <div key={product._id} className={`product-card card ${showAlert ? 'price-changed' : ''}`}>
+                <div key={product._id} className={`product-card card ${hasExplicitPriceChange ? 'price-changed' : ''}`}>
                   {product.imageUrl && (
                     <div className="product-image">
                       <img src={product.imageUrl} alt={product.title} />
@@ -443,35 +481,43 @@ const Dashboard = () => {
                   <div className="product-content">
                     <div className="product-header">
                       <span className="platform-badge">{product.platform}</span>
-                      {isJharkhandEcom && (
-                        <span className="auto-refresh-badge" title="Auto-refreshing every 5 seconds">
-                          Auto
+                      {product.priceHistory && product.priceHistory.length >= 30 && (
+                        <span className="history-badge">
+                          180D History
                         </span>
                       )}
                       <h3 className="product-title">{product.title}</h3>
                     </div>
-                    
-                    {showAlert && (
-                      <div className="price-alert">
-                        <span className="alert-icon" aria-hidden="true"></span>
-                        <div className="alert-content">
-                          <strong>{priceAlert.newPrice < priceAlert.oldPrice ? 'Competitor Dropped Price' : 'Competitor Raised Price'}</strong>
-                          <div className="price-comparison">
-                            <span className="old-price">{formatPrice(priceAlert.oldPrice, product.currency)}</span>
-                            <span className="arrow">→</span>
-                            <span className={priceAlert.newPrice < priceAlert.oldPrice ? 'new-price-down' : 'new-price-up'}>
-                              {formatPrice(priceAlert.newPrice, product.currency)}
-                            </span>
-                          </div>
-                          <div className="alert-actions">
-                            <button
-                              className="action-button ai-action-button"
-                              onClick={() => handleAIAction(product, priceAlert)}
-                              title="Get AI competitive strategy to protect your business"
-                            >
-                              Take Action
-                            </button>
-                          </div>
+
+                    {/* Price Changed Symbol & AI Strategy Action Badge */}
+                    {hasExplicitPriceChange && (
+                      <div className={`price-changed-badge ${isPriceDrop ? 'drop' : 'rise'}`}>
+                        <div className="symbol-text">
+                          <span className="badge-icon">{isPriceDrop ? '📉' : '📈'}</span>
+                          <span>
+                            <strong>Price {isPriceDrop ? 'Dropped' : 'Changed'}:</strong>{' '}
+                            {oldRefPrice ? `${formatPrice(oldRefPrice, product.currency)} → ` : ''}
+                            {formatPrice(product.currentPrice, product.currency)}
+                          </span>
+                        </div>
+                        <div className="symbol-actions">
+                          <button
+                            className="btn-take-strategy"
+                            onClick={() => handleAIAction(product, {
+                              oldPrice: oldRefPrice || product.currentPrice,
+                              newPrice: product.currentPrice
+                            })}
+                            title="Analyze competitor price change and get AI strategy"
+                          >
+                            Take AI Strategy
+                          </button>
+                          <button
+                            className="btn-dismiss-badge"
+                            onClick={() => handleDismissPriceChange(product._id)}
+                            title="Dismiss price change indicator"
+                          >
+                            ✕
+                          </button>
                         </div>
                       </div>
                     )}
@@ -491,12 +537,40 @@ const Dashboard = () => {
                         <span className="meta-value">{formatDate(product.createdAt)}</span>
                       </div>
                       <div className="meta-item">
+                        <span className="meta-label">History:</span>
+                        <span className="meta-value">
+                          {product.priceHistory?.length ? `${product.priceHistory.length} days` : '1 day'}
+                        </span>
+                      </div>
+                      <div className="meta-item">
                         <span className="meta-label">Last Checked:</span>
                         <span className="meta-value">{formatDate(product.lastChecked)}</span>
                       </div>
                     </div>
 
                     <div className="product-actions">
+                      {/* Product-Specific Ask AI Button */}
+                      <button
+                        onClick={() => handleOpenAskAI(product)}
+                        className="btn btn-primary btn-sm btn-ask-ai"
+                        title="Ask AI questions specifically about this competitor product"
+                      >
+                        💬 Ask AI
+                      </button>
+
+                      {/* AI Strategy Modal Button */}
+                      <button
+                        onClick={() => handleAIAction(product, {
+                          oldPrice: oldRefPrice || product.currentPrice,
+                          newPrice: product.currentPrice
+                        })}
+                        className="btn btn-primary btn-sm"
+                        title="Get Gemini AI Competitive Strategy & RAG Insights"
+                        style={{ background: 'linear-gradient(135deg, #6366f1 0%, #4f46e5 100%)', color: '#fff', border: 'none', fontWeight: 'bold' }}
+                      >
+                        AI Strategy
+                      </button>
+
                       <a 
                         href={product.url} 
                         target="_blank" 
@@ -512,7 +586,20 @@ const Dashboard = () => {
                       >
                         {refreshingId === product._id ? 'Refreshing...' : 'Refresh'}
                       </button>
-
+                      <button
+                        onClick={() => handleDownloadCSV(product._id, product.title)}
+                        className="btn btn-secondary btn-sm"
+                        title="Download 180-day price history as CSV"
+                      >
+                        CSV
+                      </button>
+                      <button
+                        onClick={() => handleDownloadSummary(product._id, product.title)}
+                        className="btn btn-secondary btn-sm"
+                        title="Download contextual intelligence summary"
+                      >
+                        Summary
+                      </button>
                       <button
                         onClick={() => handleDeleteProduct(product._id)}
                         className="btn btn-danger btn-sm"
@@ -529,7 +616,143 @@ const Dashboard = () => {
         </div>
       </main>
 
-      {/* AI Strategic Action Modal */}
+      {/* Product-Specific "Ask AI" Modal */}
+      {askAiModalOpen && askAiProduct && (
+        <div className="modal-overlay" onClick={handleCloseAskAI}>
+          <div className="modal-content ai-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <div className="modal-title">
+                <h2>💬 Ask AI about Competitor Product</h2>
+              </div>
+              <button 
+                className="modal-close" 
+                onClick={handleCloseAskAI}
+                aria-label="Close modal"
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="modal-product-info">
+              <h3>{askAiProduct.title}</h3>
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '6px', flexWrap: 'wrap' }}>
+                <span className="platform-badge">{askAiProduct.platform}</span>
+                <span className="platform-badge" style={{ background: 'rgba(14, 165, 233, 0.15)', color: '#0284c7' }}>
+                  Current Price: {formatPrice(askAiProduct.currentPrice, askAiProduct.currency)}
+                </span>
+                {askAiProduct.priceHistory?.length > 0 && (
+                  <span className="history-badge">
+                    {askAiProduct.priceHistory.length} Days 180D Real History
+                  </span>
+                )}
+              </div>
+            </div>
+
+            <div className="rag-indicator">
+              <div className="rag-badge">
+                <span>⚡ 180-Day Competitor Price Movement & Strategic Repricing Analysis</span>
+              </div>
+            </div>
+
+            <div className="modal-body">
+              <form onSubmit={handleAskProductAI} className="rag-form" style={{ marginTop: '4px' }}>
+                <input
+                  type="text"
+                  className="input"
+                  placeholder={`Ask a specific question about ${askAiProduct.title.substring(0, 30)}...`}
+                  value={askAiQuery}
+                  onChange={(e) => setAskAiQuery(e.target.value)}
+                  disabled={askAiLoading}
+                  autoFocus
+                />
+                <button 
+                  type="submit" 
+                  className="btn btn-primary" 
+                  disabled={askAiLoading || !askAiQuery.trim()}
+                  style={{ background: '#0284c7' }}
+                >
+                  {askAiLoading ? 'Analyzing...' : 'Ask AI'}
+                </button>
+              </form>
+
+              <div className="ask-ai-chips">
+                {[
+                  "What was the lowest price for this product in 180 days?",
+                  "Is the current price above or below its 180-day average?",
+                  "When did this competitor last change their price?",
+                  "What repricing strategy should I use against this competitor?",
+                  "How volatile is this competitor's pricing?"
+                ].map((prompt, i) => (
+                  <button
+                    key={i}
+                    type="button"
+                    className="ask-ai-chip"
+                    onClick={() => {
+                      setAskAiQuery(prompt);
+                      handleAskProductAI(null, prompt);
+                    }}
+                  >
+                    💡 {prompt}
+                  </button>
+                ))}
+              </div>
+
+              {askAiLoading && (
+                <div className="ai-loading" style={{ margin: '20px 0' }}>
+                  <div className="spinner"></div>
+                  <p>Analyzing competitor's 180-day price history...</p>
+                  <p className="rag-status">Generating focused answer for your question...</p>
+                </div>
+              )}
+
+              {askAiAnswer && (
+                <div className="ask-ai-answer-card">
+                  <div className="rag-answer-header">
+                    <span style={{ fontWeight: 700, display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <span>🎯</span> Focused Answer
+                    </span>
+                    <button
+                      className="btn-dismiss-badge"
+                      onClick={() => setAskAiAnswer('')}
+                      title="Clear answer"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                  <div className="rag-answer-body">
+                    <ReactMarkdown>{askAiAnswer}</ReactMarkdown>
+                  </div>
+                </div>
+              )}
+
+              {!askAiLoading && !askAiAnswer && (
+                <div className="ai-waiting" style={{ padding: '24px 0' }}>
+                  <p>Type a question above or click one of the suggestion chips to get instant, focused AI analysis for this product.</p>
+                </div>
+              )}
+            </div>
+
+            <div className="modal-footer">
+              <button 
+                className="btn btn-secondary"
+                onClick={handleCloseAskAI}
+              >
+                Close
+              </button>
+              <a
+                href={askAiProduct.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="btn btn-primary"
+              >
+                View Listing
+              </a>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* AI Strategic Repricing Modal */}
       {aiModalOpen && (
         <div className="modal-overlay" onClick={() => setAiModalOpen(false)}>
           <div className="modal-content ai-modal" onClick={(e) => e.stopPropagation()}>
@@ -549,13 +772,23 @@ const Dashboard = () => {
             {selectedProduct && (
               <div className="modal-product-info">
                 <h3>Competitor: {selectedProduct.title}</h3>
-                <span className="platform-badge">{selectedProduct.platform}</span>
+                <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '6px' }}>
+                  <span className="platform-badge">{selectedProduct.platform}</span>
+                  <span className="platform-badge" style={{ background: 'rgba(99, 102, 241, 0.15)', color: '#4f46e5' }}>
+                    Current: {formatPrice(selectedProduct.currentPrice, selectedProduct.currency)}
+                  </span>
+                  {selectedProduct.priceHistory?.length > 0 && (
+                    <span className="history-badge">
+                      {selectedProduct.priceHistory.length} Days History
+                    </span>
+                  )}
+                </div>
               </div>
             )}
             
             <div className="rag-indicator">
               <div className="rag-badge">
-                <span>Analyzing 180-day price history with RAG system</span>
+                <span>180-Day Competitor Price Movement & Strategic Repricing Analysis</span>
               </div>
             </div>
             
@@ -563,9 +796,9 @@ const Dashboard = () => {
               {aiLoading && (
                 <div className="ai-loading">
                   <div className="spinner"></div>
-                  <p>Loading competitor's 180-day price summary...</p>
-                  <p className="rag-status">RAG system processing historical data...</p>
-                  <p className="rag-status">AI analyzing competitive strategy...</p>
+                  <p>Loading competitor's historical price summary...</p>
+                  <p className="rag-status">Processing 180-day price history...</p>
+                  <p className="rag-status">Analyzing competitive strategy...</p>
                 </div>
               )}
               

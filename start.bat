@@ -1,19 +1,20 @@
 @echo off
+cd /d "%~dp0"
 echo ========================================
 echo   Starting Price Tracker Application
 echo ========================================
 echo.
 
 echo [1/3] Starting Backend Server (Port 5000)...
-start "Backend Server" cmd /k "cd server && node index.js"
+start "Backend Server" cmd /k "cd /d ""%~dp0server"" && node index.js"
 timeout /t 3 /nobreak >nul
 
 echo [2/3] Starting Python Scraper (Port 5001)...
-start "Python Scraper" cmd /k "cd scraper && python scraper_service.py"
+start "Python Scraper" cmd /k "cd /d ""%~dp0scraper"" && python scraper_service.py"
 timeout /t 3 /nobreak >nul
 
 echo [3/3] Starting React Frontend (Port 3000)...
-start "React Frontend" cmd /k "cd client && npm start"
+start "React Frontend" cmd /k "cd /d ""%~dp0client"" && npm start"
 
 echo.
 echo ========================================

@@ -19,7 +19,7 @@ const scrapeProductPrice = async (url) => {
     });
 
     if (response.data && response.data.success) {
-      const { title, price, currency, imageUrl, platform, description, features } = response.data;
+      const { title, price, currency, imageUrl, platform, description, features, priceHistory, isAuthenticHistory } = response.data;
       
       console.log(`Successfully scraped: ${title} - ${currency} ${price}`);
       
@@ -30,7 +30,9 @@ const scrapeProductPrice = async (url) => {
         imageUrl: imageUrl || '',
         platform: platform || 'Unknown',
         description: description || '',
-        features: features || []
+        features: features || [],
+        priceHistory: Array.isArray(priceHistory) ? priceHistory : [],
+        isAuthenticHistory: Boolean(isAuthenticHistory)
       };
     }
 

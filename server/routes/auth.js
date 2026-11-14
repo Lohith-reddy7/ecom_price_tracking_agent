@@ -5,6 +5,23 @@ import auth from '../middleware/auth.js';
 
 const router = express.Router();
 
+// Helper to generate access and refresh tokens
+const generateTokens = (userId) => {
+  const accessToken = jwt.sign(
+    { userId },
+    process.env.JWT_ACCESS_SECRET || process.env.JWT_SECRET || 'your_jwt_secret_key',
+    { expiresIn: process.env.JWT_ACCESS_EXPIRES_IN || '15m' }
+  );
+
+  const refreshToken = jwt.sign(
+    { userId },
+    process.env.JWT_REFRESH_SECRET || 'your_jwt_refresh_secret_key',
+    { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d' }
+  );
+
+  return { accessToken, refreshToken };
+};
+
 // Register
 router.post('/register', async (req, res) => {
   try {
@@ -27,17 +44,18 @@ router.post('/register', async (req, res) => {
 
     // Create user
     const user = new User({ name, email, password });
+
+    // Generate tokens
+    const { accessToken, refreshToken } = generateTokens(user._id);
+
+    // Store refresh token in user document
+    user.refreshTokens = [{ token: refreshToken, createdAt: new Date() }];
     await user.save();
 
-    // Create token
-    const token = jwt.sign(
-      { userId: user._id },
-      process.env.JWT_SECRET || 'your_jwt_secret_key',
-      { expiresIn: '7d' }
-    );
-
     res.status(201).json({
-      token,
+      accessToken,
+      refreshToken,
+      token: accessToken, // Backward compatibility
       user: {
         id: user._id,
         name: user.name,
@@ -72,15 +90,21 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ message: 'Invalid credentials' });
     }
 
-    // Create token
-    const token = jwt.sign(
-      { userId: user._id },
-      process.env.JWT_SECRET || 'your_jwt_secret_key',
-      { expiresIn: '7d' }
-    );
+    // Generate tokens
+    const { accessToken, refreshToken } = generateTokens(user._id);
+
+    // Keep up to 10 active refresh tokens
+    if (!user.refreshTokens) user.refreshTokens = [];
+    user.refreshTokens.push({ token: refreshToken, createdAt: new Date() });
+    if (user.refreshTokens.length > 10) {
+      user.refreshTokens = user.refreshTokens.slice(-10);
+    }
+    await user.save();
 
     res.json({
-      token,
+      accessToken,
+      refreshToken,
+      token: accessToken, // Backward compatibility
       user: {
         id: user._id,
         name: user.name,
@@ -90,6 +114,80 @@ router.post('/login', async (req, res) => {
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ message: 'Server error during login' });
+  }
+});
+
+// Refresh Access Token
+router.post('/refresh', async (req, res) => {
+  try {
+    const { refreshToken } = req.body;
+
+    if (!refreshToken) {
+      return res.status(400).json({ message: 'Refresh token is required' });
+    }
+
+    let decoded;
+    try {
+      decoded = jwt.verify(
+        refreshToken,
+        process.env.JWT_REFRESH_SECRET || 'your_jwt_refresh_secret_key'
+      );
+    } catch (err) {
+      return res.status(401).json({ message: 'Invalid or expired refresh token' });
+    }
+
+    // Verify token exists in database for user
+    const user = await User.findById(decoded.userId);
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    const tokenExists = user.refreshTokens && user.refreshTokens.some(rt => rt.token === refreshToken);
+    if (!tokenExists) {
+      return res.status(401).json({ message: 'Refresh token revoked or invalid' });
+    }
+
+    // Rotate refresh token
+    const newTokens = generateTokens(user._id);
+
+    // Replace old refresh token with new one
+    user.refreshTokens = user.refreshTokens.filter(rt => rt.token !== refreshToken);
+    user.refreshTokens.push({ token: newTokens.refreshToken, createdAt: new Date() });
+    await user.save();
+
+    res.json({
+      accessToken: newTokens.accessToken,
+      refreshToken: newTokens.refreshToken,
+      token: newTokens.accessToken // Backward compatibility
+    });
+  } catch (error) {
+    console.error('Token refresh error:', error);
+    res.status(500).json({ message: 'Server error during token refresh' });
+  }
+});
+
+// Logout (Revoke refresh token)
+router.post('/logout', async (req, res) => {
+  try {
+    const { refreshToken } = req.body;
+
+    if (refreshToken) {
+      try {
+        const decoded = jwt.decode(refreshToken);
+        if (decoded?.userId) {
+          await User.findByIdAndUpdate(decoded.userId, {
+            $pull: { refreshTokens: { token: refreshToken } }
+          });
+        }
+      } catch (err) {
+        console.warn('Error clearing refresh token on logout:', err.message);
+      }
+    }
+
+    res.json({ message: 'Logged out successfully' });
+  } catch (error) {
+    console.error('Logout error:', error);
+    res.status(500).json({ message: 'Server error during logout' });
   }
 });
 
